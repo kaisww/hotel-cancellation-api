@@ -1,0 +1,192 @@
+"""
+FastAPI service for the hotel booking cancellation prediction model.
+
+Loads the K-Prototypes clustering model, the preprocessing pipeline, and
+the Random Forest classifier that were trained and exported from the
+Hotel_Cancellation_Analysis_v3 notebook. Exposes a single prediction
+endpoint that a support rep's Streamlit app, or an n8n workflow, can call
+with a booking profile and receive back a cancellation probability and risk
+tier.
+
+Run locally with:
+    uvicorn app:app --reload --port 8000
+
+Deployed on Render using the start command:
+    uvicorn app:app --host 0.0.0.0 --port $PORT
+"""
+
+import json
+import os
+from datetime import date
+
+import joblib
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+ARTIFACT_DIR = os.path.join(os.path.dirname(__file__), 'model_artifacts')
+
+# ---------------------------------------------------------------------
+# Load trained artifacts once at startup
+# ---------------------------------------------------------------------
+try:
+    preprocessor = joblib.load(f'{ARTIFACT_DIR}/preprocessor.joblib')
+    rf_model = joblib.load(f'{ARTIFACT_DIR}/rf_model.joblib')
+    kproto_model = joblib.load(f'{ARTIFACT_DIR}/kproto_model.joblib')
+    cluster_scaler = joblib.load(f'{ARTIFACT_DIR}/cluster_scaler.joblib')
+    with open(f'{ARTIFACT_DIR}/metadata.json') as f:
+        METADATA = json.load(f)
+except FileNotFoundError as e:
+    raise RuntimeError(
+        "Model artifacts not found. Run the export cells at the end of the "
+        "notebook and copy the 'model_artifacts' folder next to this file "
+        f"before starting the API. Original error: {e}"
+    )
+
+FEATURE_ORDER = METADATA['feature_order']
+KPROTO_NUMERIC = METADATA['kproto_numeric']
+KPROTO_CATEGORICAL = METADATA['kproto_categorical']
+CATEGORICAL_INDICES = METADATA['categorical_indices']
+
+# Risk tier thresholds on predicted cancellation probability.
+# Adjust these based on the hotel's tolerance for false negatives, as
+# discussed in section 2c.11 of the notebook.
+LOW_RISK_MAX = 0.30
+MEDIUM_RISK_MAX = 0.60
+
+app = FastAPI(
+    title="Hotel Booking Cancellation Prediction API",
+    description="Predicts the probability that a booking will be cancelled, "
+                "and assigns the booking to a customer persona cluster.",
+    version="1.0.0",
+)
+
+
+# ---------------------------------------------------------------------
+# Request schema
+# ---------------------------------------------------------------------
+class BookingProfile(BaseModel):
+    # --- Core fields a support rep is expected to know ---
+    hotel: str = Field(..., description="'City Hotel' or 'Resort Hotel'")
+    lead_time: int = Field(..., ge=0, description="Days between booking and arrival")
+    adr: float = Field(..., ge=0, description="Average daily rate")
+    total_nights: int = Field(..., ge=1)
+    adults: int = Field(..., ge=1)
+    children: int = Field(0, ge=0)
+    market_segment: str = Field(..., description="e.g. 'Online TA', 'Direct', 'Corporate'")
+    customer_type: str = Field(..., description="e.g. 'Transient', 'Contract', 'Group'")
+    deposit_type: str = Field(..., description="'No Deposit', 'Non Refund', or 'Refundable'")
+    previous_cancellations: int = Field(0, ge=0)
+    booking_changes: int = Field(0, ge=0)
+    total_of_special_requests: int = Field(0, ge=0)
+    required_car_parking_spaces: int = Field(0, ge=0)
+
+    # --- Advanced / rarely known fields, filled with sensible defaults ---
+    arrival_date_year: int = Field(default_factory=lambda: date.today().year)
+    arrival_date_month: str = Field(default_factory=lambda: date.today().strftime('%B'))
+    arrival_date_week_number: int = Field(default_factory=lambda: date.today().isocalendar()[1])
+    arrival_date_day_of_month: int = Field(default_factory=lambda: date.today().day)
+    stays_in_weekend_nights: int = Field(0, ge=0)
+    stays_in_week_nights: int = Field(None, ge=0)
+    babies: int = Field(0, ge=0)
+    meal: str = Field("BB")
+    country: str = Field("Unknown")
+    distribution_channel: str = Field("Direct")
+    is_repeated_guest: int = Field(0, ge=0, le=1)
+    previous_bookings_not_canceled: int = Field(0, ge=0)
+    reserved_room_type: str = Field("A")
+    assigned_room_type: str = Field("A")
+    agent: int = Field(0, ge=0)
+    days_in_waiting_list: int = Field(0, ge=0)
+
+    def to_feature_row(self) -> dict:
+        data = self.dict()
+        # If the advanced weekend/week night split was not supplied,
+        # default to putting all nights in week nights.
+        if data['stays_in_week_nights'] is None:
+            data['stays_in_week_nights'] = data['total_nights'] - data['stays_in_weekend_nights']
+        return data
+
+
+class PredictionResponse(BaseModel):
+    cancellation_probability: float
+    risk_tier: str
+    customer_persona_cluster: str
+
+
+# ---------------------------------------------------------------------
+# Helper: assemble a single feature row in the exact column order and
+# dtype layout the trained pipeline expects
+# ---------------------------------------------------------------------
+def build_feature_row(profile: BookingProfile) -> pd.DataFrame:
+    raw = profile.to_feature_row()
+    row = pd.DataFrame([raw])
+
+    # --- Step 1: assign the customer persona cluster using K-Prototypes ---
+    cluster_input = row[KPROTO_NUMERIC].copy()
+    cluster_input[KPROTO_NUMERIC] = cluster_scaler.transform(cluster_input[KPROTO_NUMERIC])
+    for col in KPROTO_CATEGORICAL:
+        cluster_input[col] = row[col].values
+    cluster_matrix = cluster_input[KPROTO_NUMERIC + KPROTO_CATEGORICAL].values
+    persona_cluster = kproto_model.predict(cluster_matrix, categorical=CATEGORICAL_INDICES)[0]
+    row['customer_persona_cluster'] = str(persona_cluster)
+
+    # --- Step 2: reorder columns to match training-time feature order ---
+    missing = [c for c in FEATURE_ORDER if c not in row.columns]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Missing engineered columns: {missing}")
+
+    return row[FEATURE_ORDER]
+
+
+def risk_tier_from_probability(p: float) -> str:
+    if p < LOW_RISK_MAX:
+        return "Low"
+    elif p < MEDIUM_RISK_MAX:
+        return "Medium"
+    return "High"
+
+
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
+@app.get("/health")
+def health_check():
+    """Simple liveness check used by Render and by n8n before calling /predict."""
+    return {"status": "ok"}
+
+
+@app.post("/predict", response_model=PredictionResponse)
+def predict(profile: BookingProfile):
+    """
+    Accepts a customer / booking profile and returns the predicted
+    cancellation probability, a risk tier derived from that
+    probability, and the customer persona cluster assigned by the
+    K-Prototypes model trained in the notebook.
+    """
+    try:
+        feature_row = build_feature_row(profile)
+        encoded_row = preprocessor.transform(feature_row)
+        probability = float(rf_model.predict_proba(encoded_row)[0, 1])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction failed: {e}")
+
+    return PredictionResponse(
+        cancellation_probability=round(probability, 4),
+        risk_tier=risk_tier_from_probability(probability),
+        customer_persona_cluster=str(feature_row['customer_persona_cluster'].iloc[0]),
+    )
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Hotel Booking Cancellation Prediction API",
+        "endpoints": {
+            "GET /health": "Liveness check",
+            "POST /predict": "Predict cancellation probability from a booking profile",
+        },
+    }
