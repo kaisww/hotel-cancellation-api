@@ -18,7 +18,8 @@
     "adr",
     "required_car_parking_spaces",
     "total_of_special_requests",
-    "total_nights"
+    "total_nights",
+    "room_mismatch"
   ],
   "categorical_cols": [
     "hotel",
@@ -27,8 +28,6 @@
     "country",
     "market_segment",
     "distribution_channel",
-    "reserved_room_type",
-    "assigned_room_type",
     "deposit_type",
     "customer_type",
     "customer_persona_cluster"
@@ -52,8 +51,6 @@
     "is_repeated_guest",
     "previous_cancellations",
     "previous_bookings_not_canceled",
-    "reserved_room_type",
-    "assigned_room_type",
     "booking_changes",
     "deposit_type",
     "agent",
@@ -63,6 +60,7 @@
     "required_car_parking_spaces",
     "total_of_special_requests",
     "total_nights",
+    "room_mismatch",
     "customer_persona_cluster"
   ],
   "kproto_numeric": [
@@ -70,14 +68,22 @@
     "adr",
     "total_nights",
     "adults",
-    "children"
+    "children",
+    "previous_cancellations",
+    "total_of_special_requests",
+    "required_car_parking_spaces",
+    "booking_changes"
   ],
   "kproto_categorical": [
     "customer_type",
-    "market_segment"
+    "market_segment",
+    "is_repeated_guest",
+    "deposit_type"
   ],
   "categorical_indices": [
-    5,
-    6
+    9,
+    10,
+    11,
+    12
   ]
 }
