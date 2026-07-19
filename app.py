@@ -1,12 +1,18 @@
 """
 FastAPI service for the hotel booking cancellation prediction model.
 
-Loads the K-Prototypes clustering model, the preprocessing pipeline, and
-the Random Forest classifier that were trained and exported from the
-Hotel_Cancellation_Analysis_v3 notebook. Exposes a single prediction
-endpoint that a support rep's Streamlit app, or an n8n workflow, can call
-with a booking profile and receive back a cancellation probability and risk
-tier.
+This matches the v4 notebook: 28 model features (29 minus room_mismatch,
+see note below), and a K-Prototypes clustering step using 13 of those
+features.
+
+`room_mismatch` (whether the assigned room differs from the reserved
+room) was engineered in the notebook and is a strong bivariate predictor,
+but it is excluded from the model here. It is only knowable once a
+booking has already survived to the hotel's room allocation stage close
+to arrival, so it is a form of target leakage: its value is a near
+consequence of the booking not having cancelled, not an independent
+signal available at prediction time. It remains a legitimate and useful
+finding in the notebook's EDA, just not a fair input to this model.
 
 Run locally with:
     uvicorn app:app --reload --port 8000
@@ -50,8 +56,8 @@ KPROTO_CATEGORICAL = METADATA['kproto_categorical']
 CATEGORICAL_INDICES = METADATA['categorical_indices']
 
 # Risk tier thresholds on predicted cancellation probability.
-# Adjust these based on the hotel's tolerance for false negatives, as
-# discussed in section 2c.11 of the notebook.
+# Confirm these against the validation-set probability distribution
+# for your own trained model before relying on them operationally.
 LOW_RISK_MAX = 0.30
 MEDIUM_RISK_MAX = 0.60
 
@@ -59,15 +65,22 @@ app = FastAPI(
     title="Hotel Booking Cancellation Prediction API",
     description="Predicts the probability that a booking will be cancelled, "
                 "and assigns the booking to a customer persona cluster.",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 
 # ---------------------------------------------------------------------
 # Request schema
+#
+# Fields are grouped by how much they matter to the prediction, based on
+# the feature importance and Cramer's V results from the v4 notebook, and
+# by whether a support rep could realistically know the value at the time
+# of the call. Core fields are required. Advanced fields have defaults
+# and can be left out entirely.
 # ---------------------------------------------------------------------
 class BookingProfile(BaseModel):
-    # --- Core fields a support rep is expected to know ---
+    # --- Core fields: the strongest predictors, and the ones a rep would
+    #     realistically know when reviewing an upcoming booking ---
     hotel: str = Field(..., description="'City Hotel' or 'Resort Hotel'")
     lead_time: int = Field(..., ge=0, description="Days between booking and arrival")
     adr: float = Field(..., ge=0, description="Average daily rate")
@@ -77,12 +90,17 @@ class BookingProfile(BaseModel):
     market_segment: str = Field(..., description="e.g. 'Online TA', 'Direct', 'Corporate'")
     customer_type: str = Field(..., description="e.g. 'Transient', 'Contract', 'Group'")
     deposit_type: str = Field(..., description="'No Deposit', 'Non Refund', or 'Refundable'")
-    previous_cancellations: int = Field(0, ge=0)
+    previous_cancellations: int = Field(0, ge=0, description="Strongest behavioural signal after lead time")
+    is_repeated_guest: int = Field(0, ge=0, le=1, description="1 if this guest has stayed before")
     booking_changes: int = Field(0, ge=0)
     total_of_special_requests: int = Field(0, ge=0)
     required_car_parking_spaces: int = Field(0, ge=0)
 
-    # --- Advanced / rarely known fields, filled with sensible defaults ---
+    # --- Advanced fields: shown to matter less in the notebook's Cramer's V
+    #     / feature importance results (meal, distribution_channel, country,
+    #     previous_bookings_not_canceled). Note that room_mismatch is not
+    #     listed here at all: it is excluded from the model entirely, see
+    #     the module docstring above. ---
     arrival_date_year: int = Field(default_factory=lambda: date.today().year)
     arrival_date_month: str = Field(default_factory=lambda: date.today().strftime('%B'))
     arrival_date_week_number: int = Field(default_factory=lambda: date.today().isocalendar()[1])
@@ -90,20 +108,15 @@ class BookingProfile(BaseModel):
     stays_in_weekend_nights: int = Field(0, ge=0)
     stays_in_week_nights: int = Field(None, ge=0)
     babies: int = Field(0, ge=0)
-    meal: str = Field("BB")
-    country: str = Field("Unknown")
-    distribution_channel: str = Field("Direct")
-    is_repeated_guest: int = Field(0, ge=0, le=1)
+    meal: str = Field("BB", description="Lowest Cramer's V of the tested categorical features")
+    country: str = Field("PRT", description="Not individually tested in the v4 notebook; high cardinality")
+    distribution_channel: str = Field("Direct", description="Overlaps conceptually with market_segment")
     previous_bookings_not_canceled: int = Field(0, ge=0)
-    reserved_room_type: str = Field("A")
-    assigned_room_type: str = Field("A")
     agent: int = Field(0, ge=0)
     days_in_waiting_list: int = Field(0, ge=0)
 
     def to_feature_row(self) -> dict:
         data = self.dict()
-        # If the advanced weekend/week night split was not supplied,
-        # default to putting all nights in week nights.
         if data['stays_in_week_nights'] is None:
             data['stays_in_week_nights'] = data['total_nights'] - data['stays_in_weekend_nights']
         return data
@@ -160,10 +173,9 @@ def health_check():
 @app.post("/predict", response_model=PredictionResponse)
 def predict(profile: BookingProfile):
     """
-    Accepts a customer / booking profile and returns the predicted
-    cancellation probability, a risk tier derived from that
-    probability, and the customer persona cluster assigned by the
-    K-Prototypes model trained in the notebook.
+    Accepts a booking profile and returns the predicted cancellation
+    probability, a risk tier derived from that probability, and the
+    customer persona cluster assigned by the K-Prototypes model.
     """
     try:
         feature_row = build_feature_row(profile)

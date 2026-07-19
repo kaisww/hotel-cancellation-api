@@ -18,8 +18,7 @@
     "adr",
     "required_car_parking_spaces",
     "total_of_special_requests",
-    "total_nights",
-    "room_mismatch"
+    "total_nights"
   ],
   "categorical_cols": [
     "hotel",
@@ -60,7 +59,6 @@
     "required_car_parking_spaces",
     "total_of_special_requests",
     "total_nights",
-    "room_mismatch",
     "customer_persona_cluster"
   ],
   "kproto_numeric": [
