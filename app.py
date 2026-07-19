@@ -3,7 +3,10 @@ FastAPI service for the hotel booking cancellation prediction model.
 
 This matches the v4 notebook: 28 model features (29 minus room_mismatch,
 see note below), and a K-Prototypes clustering step using 13 of those
-features.
+features. Of the 27 fields a caller supplies, 17 are required "core"
+fields and 10 are optional "advanced" fields with defaults (see the
+BookingProfile class below for the exact split and the reasoning behind
+it, informed by Section 6.7's feature importance ranking).
 
 `room_mismatch` (whether the assigned room differs from the reserved
 room) was engineered in the notebook and is a strong bivariate predictor,
@@ -23,13 +26,13 @@ Deployed on Render using the start command:
 
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 
 import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 
 ARTIFACT_DIR = os.path.join(os.path.dirname(__file__), 'model_artifacts')
 
@@ -95,25 +98,51 @@ class BookingProfile(BaseModel):
     booking_changes: int = Field(0, ge=0)
     total_of_special_requests: int = Field(0, ge=0)
     required_car_parking_spaces: int = Field(0, ge=0)
+    # Promoted from Advanced: Section 6.7's feature importance ranking places
+    # country 2nd overall and agent 6th (ahead of deposit_type, adr, and
+    # several other core fields), and arrival_date_month drives the seasonal
+    # pattern documented in Section 5.4. A static default for any of the
+    # three would silently override one of the model's strongest signals,
+    # so all three are required rather than defaulted.
+    country: str = Field(..., description="3-letter guest country code, e.g. 'PRT', 'GBR'. Ranked 2nd in feature importance (Section 6.7); do not default this.")
+    agent: int = Field(..., ge=0, description="Booking agent ID, 0 if booked direct. Ranked 6th in feature importance (Section 6.7); do not default this.")
+    arrival_date_month: str = Field(..., description="e.g. 'July'. Drives the seasonal cancellation pattern found in the EDA (Section 5.4); always supply the guest's real arrival month.")
 
-    # --- Advanced fields: shown to matter less in the notebook's Cramer's V
-    #     / feature importance results (meal, distribution_channel, country,
-    #     previous_bookings_not_canceled). Note that room_mismatch is not
-    #     listed here at all: it is excluded from the model entirely, see
-    #     the module docstring above. ---
-    arrival_date_year: int = Field(default_factory=lambda: date.today().year)
-    arrival_date_month: str = Field(default_factory=lambda: date.today().strftime('%B'))
-    arrival_date_week_number: int = Field(default_factory=lambda: date.today().isocalendar()[1])
-    arrival_date_day_of_month: int = Field(default_factory=lambda: date.today().day)
+    # --- Advanced fields: lower Cramer's V / feature importance in the v4
+    #     notebook (meal, distribution_channel, previous_bookings_not_canceled).
+    #     room_mismatch is not listed here at all: it is excluded from the
+    #     model entirely, see the module docstring above. ---
+    #
+    # arrival_date_year/week_number/day_of_month are lower-signal than the
+    # month itself, so they remain optional. If not supplied, they are
+    # derived from lead_time (today + lead_time days) rather than from
+    # today's date, so a call made next week doesn't silently change the
+    # implied arrival date of an otherwise-identical booking.
+    arrival_date_year: int = Field(None, description="Defaults to (today + lead_time days).year if not supplied")
+    arrival_date_week_number: int = Field(None, description="Defaults to (today + lead_time days) ISO week if not supplied")
+    arrival_date_day_of_month: int = Field(None, description="Defaults to (today + lead_time days).day if not supplied")
     stays_in_weekend_nights: int = Field(0, ge=0)
     stays_in_week_nights: int = Field(None, ge=0)
     babies: int = Field(0, ge=0)
     meal: str = Field("BB", description="Lowest Cramer's V of the tested categorical features")
-    country: str = Field("PRT", description="Not individually tested in the v4 notebook; high cardinality")
     distribution_channel: str = Field("Direct", description="Overlaps conceptually with market_segment")
     previous_bookings_not_canceled: int = Field(0, ge=0)
-    agent: int = Field(0, ge=0)
     days_in_waiting_list: int = Field(0, ge=0)
+
+    @root_validator
+    def fill_date_defaults(cls, values):
+        """Fall back to (today + lead_time days) rather than today's date,
+        so an otherwise-identical booking doesn't get a different implied
+        arrival date just because the API was called on a different day."""
+        lead_time = values.get('lead_time') or 0
+        estimated_arrival = date.today() + timedelta(days=lead_time)
+        if values.get('arrival_date_year') is None:
+            values['arrival_date_year'] = estimated_arrival.year
+        if values.get('arrival_date_week_number') is None:
+            values['arrival_date_week_number'] = estimated_arrival.isocalendar()[1]
+        if values.get('arrival_date_day_of_month') is None:
+            values['arrival_date_day_of_month'] = estimated_arrival.day
+        return values
 
     def to_feature_row(self) -> dict:
         data = self.dict()
